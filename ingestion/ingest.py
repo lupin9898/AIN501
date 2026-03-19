@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import uuid
+import re
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -26,199 +27,282 @@ from qdrant_client import models
 from config import settings
 from retrieval.embedder import HyDEEmbedder
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
-MIN_CHUNK_LENGTH = 10  # Chunks shorter than this are skipped (validation)
-SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md")
+DATA_DIRECTORY = Path(__file__).resolve().parent.parent / "data"
+
+CHUNK_SIZE_LIMIT = 1200 
+CHUNK_OVERLAP_SIZE = 200
+MINIMUM_CHUNK_LENGTH = 50  
+SUPPORTED_FILE_EXTENSIONS = (".pdf", ".txt", ".md")
+
+# ---------------------------------------------------------------------
+# Backward-compatible aliases (giu cho cac file khac trong project khong bi gay)
+# ---------------------------------------------------------------------
+# UI/README/old code trong repo nay tung dung cac ten sau:
+#   - DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_LENGTH, SUPPORTED_EXTENSIONS
+#   - _load_documents, _ensure_collection, run
+# Ban da refactor sang ten moi; alias duoi day giup tuong thich nguoc.
+DATA_DIR = DATA_DIRECTORY
+CHUNK_SIZE = CHUNK_SIZE_LIMIT
+CHUNK_OVERLAP = CHUNK_OVERLAP_SIZE
+MIN_CHUNK_LENGTH = MINIMUM_CHUNK_LENGTH
+SUPPORTED_EXTENSIONS = SUPPORTED_FILE_EXTENSIONS
 
 
 def _load_documents(source: Path):
-    """Load documents from a directory or single file."""
-    if source.is_file():
-        ext = source.suffix.lower()
-        if ext == ".pdf":
-            loader = PyPDFLoader(str(source))
-        else:
-            loader = TextLoader(str(source), encoding="utf-8")
-        return loader.load()
+    return load_documents_from_source(source)
 
-    # Directory — load all supported types
-    loaders = []
-    for pattern, loader_cls, kwargs in [
+
+def _ensure_collection(client, collection_name: str, vector_size: int, log=None):
+    return ensure_qdrant_collection_exists(
+        qdrant_client=client,
+        target_collection_name=collection_name,
+        embedding_vector_size=vector_size,
+        logger_function=log,
+    )
+
+
+def run(source: Path | None = None, on_progress: Optional[Callable[[str], None]] = None) -> dict:
+    """Wrapper tuong thich nguoc cho pipeline ingestion.
+
+    Tra ve cac key cu de cac noi khac (vd `ui.py`) van chay:
+      docs_loaded, chunks_created, chunks_upserted
+    """
+    stats = execute_ingestion_pipeline(
+        source_path_input=source,
+        progress_callback_function=on_progress,
+    )
+    return {
+        "docs_loaded": stats.get("documents_loaded_count", 0),
+        "chunks_created": stats.get("chunks_created_count", 0),
+        "chunks_upserted": stats.get("chunks_upserted_count", 0),
+    }
+
+
+def clean_extracted_pdf_text_content(raw_text_content: str) -> str:
+    """Tiền xử lý văn bản từ PDF: Gộp các từ bị rớt dòng và khôi phục cấu trúc đoạn văn."""
+    text_lines_list = raw_text_content.split('\n')
+    cleaned_text_lines_list = []
+    
+    for text_line in text_lines_list:
+        stripped_text_line = text_line.strip()
+        if stripped_text_line:
+            cleaned_text_lines_list.append(stripped_text_line)
+            
+    reconstructed_text_content = ""
+    for text_line in cleaned_text_lines_list:
+        if text_line.startswith("+") or text_line.startswith("-") or text_line.startswith("*"):
+            reconstructed_text_content += "\n" + text_line + " "
+        else:
+            reconstructed_text_content += text_line + " "
+            
+    reconstructed_text_content = reconstructed_text_content.replace(". ", ".\n\n")
+    final_cleaned_text_content = re.sub(r' +', ' ', reconstructed_text_content)
+    
+    return final_cleaned_text_content.strip()
+
+
+def load_documents_from_source(source_path: Path):
+    """Load documents from a directory or single file."""
+    if source_path.is_file():
+        file_extension = source_path.suffix.lower()
+        if file_extension == ".pdf":
+            pdf_loader = PyPDFLoader(str(source_path))
+            loaded_documents = pdf_loader.load()
+        else:
+            text_loader = TextLoader(str(source_path), encoding="utf-8")
+            loaded_documents = text_loader.load()
+            
+        if file_extension == ".pdf":
+            for document_item in loaded_documents:
+                document_item.page_content = clean_extracted_pdf_text_content(document_item.page_content)
+        return loaded_documents
+
+    document_loaders_list = []
+    for search_pattern, loader_class, keyword_arguments in [
         ("**/*.pdf", PyPDFLoader, {}),
         ("**/*.txt", TextLoader, {"encoding": "utf-8"}),
         ("**/*.md", TextLoader, {"encoding": "utf-8"}),
     ]:
-        loaders.append(
+        document_loaders_list.append(
             DirectoryLoader(
-                str(source),
-                glob=pattern,
-                loader_cls=loader_cls,
-                loader_kwargs=kwargs,
+                str(source_path),
+                glob=search_pattern,
+                loader_cls=loader_class,
+                loader_kwargs=keyword_arguments,
                 silent_errors=True,
             )
         )
 
-    docs = []
-    for loader in loaders:
-        docs.extend(loader.load())
-    return docs
+    all_loaded_documents = []
+    for document_loader in document_loaders_list:
+        documents_from_loader = document_loader.load()
+        for document_item in documents_from_loader:
+            document_source_path = document_item.metadata.get("source", "")
+            if document_source_path.lower().endswith(".pdf"):
+                document_item.page_content = clean_extracted_pdf_text_content(document_item.page_content)
+        all_loaded_documents.extend(documents_from_loader)
+        
+    return all_loaded_documents
 
 
-def _ensure_collection(client, collection_name: str, vector_size: int, log=None):
+def ensure_qdrant_collection_exists(qdrant_client, target_collection_name: str, embedding_vector_size: int, logger_function=None):
     """Create the Qdrant collection if it doesn't exist; else check vector size matches."""
-    log = log or (lambda msg: print(msg))
-    collections = [c.name for c in client.get_collections().collections]
-    if collection_name not in collections:
-        client.create_collection(
-            collection_name=collection_name,
+    logger_function = logger_function or (lambda message: print(message))
+    existing_collections_list = [collection.name for collection in qdrant_client.get_collections().collections]
+    
+    if target_collection_name not in existing_collections_list:
+        qdrant_client.create_collection(
+            collection_name=target_collection_name,
             vectors_config=models.VectorParams(
-                size=vector_size,
+                size=embedding_vector_size,
                 distance=models.Distance.COSINE,
             ),
         )
-        log(f"[Ingest] Đã tạo collection '{collection_name}'")
+        logger_function(f"[Ingest] Đã tạo collection mới: '{target_collection_name}'")
     else:
-        info = client.get_collection(collection_name)
-        existing_size = info.config.params.vectors.size
-        if existing_size != vector_size:
+        collection_information = qdrant_client.get_collection(target_collection_name)
+        existing_vector_size = collection_information.config.params.vectors.size
+        if existing_vector_size != embedding_vector_size:
             raise ValueError(
-                f"Kích thước vector không khớp: collection '{collection_name}' có size {existing_size}, "
-                f"trong khi model embedding trả về {vector_size}. Hãy dùng collection mới hoặc cùng model embedding."
+                f"Kích thước vector không khớp: collection '{target_collection_name}' có kích thước {existing_vector_size}, "
+                f"trong khi model embedding trả về {embedding_vector_size}. Hãy tạo collection mới hoặc sử dụng model embedding tương ứng."
             )
-        log(f"[Ingest] Collection '{collection_name}' đã tồn tại")
+        logger_function(f"[Ingest] Collection '{target_collection_name}' đã tồn tại và hợp lệ")
 
 
-def run(
-    source: Path | None = None,
-    on_progress: Optional[Callable[[str], None]] = None,
+def execute_ingestion_pipeline(
+    source_path_input: Path | None = None,
+    progress_callback_function: Optional[Callable[[str], None]] = None,
 ) -> dict:
-    """Main ingestion pipeline.
+    """Main ingestion pipeline."""
+    source_path_input = source_path_input or DATA_DIRECTORY
+    logger_function = progress_callback_function or (lambda message: print(message))
 
-    Args:
-        source: File or directory to ingest. Defaults to ./data/.
-        on_progress: Optional callback for progress updates.
+    if not source_path_input.exists():
+        logger_function(f"Lỗi: đường dẫn dữ liệu không tồn tại: {source_path_input}")
+        return {"documents_loaded_count": 0, "chunks_created_count": 0, "chunks_upserted_count": 0}
+        
+    if source_path_input.is_file() and source_path_input.suffix.lower() not in SUPPORTED_FILE_EXTENSIONS:
+        logger_function(f"Lỗi: định dạng tệp '{source_path_input.suffix}' không được hỗ trợ. Chỉ hỗ trợ: {', '.join(SUPPORTED_FILE_EXTENSIONS)}")
+        return {"documents_loaded_count": 0, "chunks_created_count": 0, "chunks_upserted_count": 0}
 
-    Returns:
-        dict with keys: docs_loaded, chunks_created, chunks_upserted
-    """
-    source = source or DATA_DIR
-    log = on_progress or (lambda msg: print(msg))
-
-    # 0. Validate source exists
-    if not source.exists():
-        log(f"Lỗi: đường dẫn không tồn tại: {source}")
-        return {"docs_loaded": 0, "chunks_created": 0, "chunks_upserted": 0}
-    # When source is a file, only allow supported formats
-    if source.is_file() and source.suffix.lower() not in SUPPORTED_EXTENSIONS:
-        log(f"Lỗi: định dạng '{source.suffix}' không hỗ trợ. Chỉ dùng: {', '.join(SUPPORTED_EXTENSIONS)}")
-        return {"docs_loaded": 0, "chunks_created": 0, "chunks_upserted": 0}
-
-    # 1. Load
-    log(f"Đang tải tài liệu từ {source.name} ...")
+    logger_function(f"Đang tiến hành tải tài liệu từ {source_path_input.name} ...")
     try:
-        docs = _load_documents(source)
-    except Exception as e:
-        log(f"Lỗi khi tải tài liệu: {e}")
-        return {"docs_loaded": 0, "chunks_created": 0, "chunks_upserted": 0}
-    if not docs:
-        log("Không tìm thấy tài liệu nào.")
-        return {"docs_loaded": 0, "chunks_created": 0, "chunks_upserted": 0}
-    log(f"Đã tải {len(docs)} tài liệu.")
+        loaded_documents_list = load_documents_from_source(source_path_input)
+    except Exception as document_loading_error:
+        logger_function(f"Lỗi trong quá trình đọc tài liệu: {document_loading_error}")
+        return {"documents_loaded_count": 0, "chunks_created_count": 0, "chunks_upserted_count": 0}
+        
+    if not loaded_documents_list:
+        logger_function("Không tìm thấy dữ liệu văn bản nào trong đường dẫn.")
+        return {"documents_loaded_count": 0, "chunks_created_count": 0, "chunks_upserted_count": 0}
+    logger_function(f"Đã tải thành công {len(loaded_documents_list)} tài liệu gốc.")
 
-    # 2. Chunk
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
+    text_document_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE_LIMIT,
+        chunk_overlap=CHUNK_OVERLAP_SIZE,
+        separators=["\n\n", "\n+ ", "\n- ", "\n* ", "\n", " ", ""],
         length_function=len,
     )
-    chunks = splitter.split_documents(docs)
-    # Filter out empty or too-short chunks (noise, save embedding cost)
-    original_count = len(chunks)
-    chunks = [c for c in chunks if (c.page_content or "").strip() and len((c.page_content or "").strip()) >= MIN_CHUNK_LENGTH]
-    if len(chunks) < original_count:
-        log(f"Đã bỏ {original_count - len(chunks)} chunk rỗng hoặc quá ngắn.")
-    if not chunks:
-        log("Không còn chunk nào sau khi lọc.")
-        return {"docs_loaded": len(docs), "chunks_created": 0, "chunks_upserted": 0}
-    log(f"Đã chia thành {len(chunks)} chunk.")
+    
+    document_chunks_list = text_document_splitter.split_documents(loaded_documents_list)
+    valid_document_chunks_list = []
+    
+    for document_chunk in document_chunks_list:
+        chunk_text_content = (document_chunk.page_content or "").strip()
+        
+        # BƯỚC DỌN DẸP HẬU KỲ CHUNK (POST-PROCESSING)
+        chunk_text_content = re.sub(r'\n[ \t]+', '\n', chunk_text_content)
+        chunk_text_content = re.sub(r'\n{3,}', '\n\n', chunk_text_content)
+        chunk_text_content = chunk_text_content.strip()
+        
+        if chunk_text_content and len(chunk_text_content) >= MINIMUM_CHUNK_LENGTH:
+            document_chunk.page_content = chunk_text_content
+            valid_document_chunks_list.append(document_chunk)
+            
+    if not valid_document_chunks_list:
+        logger_function("Không tạo được đoạn chunk nào hợp lệ sau quá trình lọc.")
+        return {"documents_loaded_count": len(loaded_documents_list), "chunks_created_count": 0, "chunks_upserted_count": 0}
+        
+    logger_function(f"Đã chia tài liệu thành {len(valid_document_chunks_list)} đoạn chunk chứa ngữ nghĩa.")
 
-    # 3. Embed (with error handling)
-    embedder = HyDEEmbedder()
-    texts = [c.page_content for c in chunks]
-    log("Đang embedding các chunk ...")
+    hyde_embedding_model = HyDEEmbedder()
+    chunk_text_strings_list = [document_chunk.page_content for document_chunk in valid_document_chunks_list]
+    logger_function("Đang tiến hành tạo vector embedding cho các đoạn chunk ...")
+    
     try:
-        vectors = embedder.embed_documents(texts)
-    except Exception as e:
-        log(f"Lỗi embedding: {e}")
+        embedding_vectors_list = hyde_embedding_model.embed_documents(chunk_text_strings_list)
+    except Exception as embedding_generation_error:
+        logger_function(f"Lỗi trong quá trình tạo embedding: {embedding_generation_error}")
         return {
-            "docs_loaded": len(docs),
-            "chunks_created": len(chunks),
-            "chunks_upserted": 0,
+            "documents_loaded_count": len(loaded_documents_list),
+            "chunks_created_count": len(valid_document_chunks_list),
+            "chunks_upserted_count": 0,
         }
-    if not vectors:
-        log("Không tạo được vector nào.")
-        return {"docs_loaded": len(docs), "chunks_created": len(chunks), "chunks_upserted": 0}
-    # Ensure we got one vector per chunk (avoid silent drop if API returns fewer)
-    if len(vectors) != len(chunks):
-        log(f"Lỗi: embedding trả về {len(vectors)} vector cho {len(chunks)} chunk. Đã dừng.")
-        return {"docs_loaded": len(docs), "chunks_created": len(chunks), "chunks_upserted": 0}
-    vector_size = len(vectors[0])
+        
+    if not embedding_vectors_list or len(embedding_vectors_list) != len(valid_document_chunks_list):
+        logger_function("Hệ thống khởi tạo vector thất bại hoặc số lượng vector không khớp với chunk. Đã dừng tiến trình an toàn.")
+        return {"documents_loaded_count": len(loaded_documents_list), "chunks_created_count": len(valid_document_chunks_list), "chunks_upserted_count": 0}
+        
+    embedding_vector_dimensions_size = len(embedding_vectors_list[0])
 
-    # 4. Ensure Qdrant collection exists (and vector size matches if existing)
     from retrieval.qdrant_client import QdrantRetriever
 
     try:
-        retriever = QdrantRetriever()
-        _ensure_collection(retriever.client, settings.COLLECTION_NAME, vector_size, log=log)
-    except ValueError as e:
-        log(str(e))
-        return {"docs_loaded": len(docs), "chunks_created": len(chunks), "chunks_upserted": 0}
-    except Exception as e:
-        log(f"Không thể kết nối Qdrant: {e}")
-        return {"docs_loaded": len(docs), "chunks_created": len(chunks), "chunks_upserted": 0}
+        qdrant_database_retriever = QdrantRetriever()
+        ensure_qdrant_collection_exists(
+            qdrant_client=qdrant_database_retriever.client, 
+            target_collection_name=settings.COLLECTION_NAME, 
+            embedding_vector_size=embedding_vector_dimensions_size, 
+            logger_function=logger_function
+        )
+    except Exception as qdrant_connection_error:
+        logger_function(f"Lỗi kết nối cơ sở dữ liệu: {qdrant_connection_error}")
+        return {"documents_loaded_count": len(loaded_documents_list), "chunks_created_count": len(valid_document_chunks_list), "chunks_upserted_count": 0}
 
-    # 5. Upsert — use UUID-based IDs to avoid overwriting previous uploads
-    points = []
-    for chunk, vector in zip(chunks, vectors):
-        points.append(
+    qdrant_point_structures_list = []
+    for document_chunk, embedding_vector in zip(valid_document_chunks_list, embedding_vectors_list):
+        qdrant_point_structures_list.append(
             models.PointStruct(
                 id=str(uuid.uuid4()),
-                vector=vector,
+                vector=embedding_vector,
                 payload={
-                    "page_content": chunk.page_content,
-                    "metadata": chunk.metadata,
+                    "page_content": document_chunk.page_content,
+                    "metadata": document_chunk.metadata,
                 },
             )
         )
 
-    # Batch upsert (100 points per batch)
-    batch_size = 100
-    for i in range(0, len(points), batch_size):
-        batch = points[i : i + batch_size]
+    upsert_batch_size = 100
+    total_upserted_points_count = 0
+    
+    for batch_start_index in range(0, len(qdrant_point_structures_list), upsert_batch_size):
+        current_batch_points = qdrant_point_structures_list[batch_start_index : batch_start_index + upsert_batch_size]
         try:
-            retriever.client.upsert(
+            qdrant_database_retriever.client.upsert(
                 collection_name=settings.COLLECTION_NAME,
-                points=batch,
+                points=current_batch_points,
             )
-        except Exception as e:
-            log(f"Lỗi ghi batch {i // batch_size + 1}: {e}")
+            total_upserted_points_count += len(current_batch_points)
+        except Exception as batch_upsert_error:
+            current_batch_number = (batch_start_index // upsert_batch_size) + 1
+            logger_function(f"Lỗi khi ghi dữ liệu tại lô thứ {current_batch_number}: {batch_upsert_error}")
             return {
-                "docs_loaded": len(docs),
-                "chunks_created": len(chunks),
-                "chunks_upserted": i,  # partial
+                "documents_loaded_count": len(loaded_documents_list),
+                "chunks_created_count": len(valid_document_chunks_list),
+                "chunks_upserted_count": total_upserted_points_count, 
             }
-        log(f"Đã ghi {min(i + batch_size, len(points))}/{len(points)} chunk ...")
+            
+        progress_count = min(batch_start_index + upsert_batch_size, len(qdrant_point_structures_list))
+        logger_function(f"Đã lưu thành công {progress_count}/{len(qdrant_point_structures_list)} đoạn chunk vào Qdrant ...")
 
-    log(f"Hoàn tất! Đã index {len(points)} chunk.")
+    logger_function(f"Tiến trình hoàn tất! Đã đưa vào index thành công tổng cộng {len(qdrant_point_structures_list)} đoạn chunk.")
     return {
-        "docs_loaded": len(docs),
-        "chunks_created": len(chunks),
-        "chunks_upserted": len(points),
+        "documents_loaded_count": len(loaded_documents_list),
+        "chunks_created_count": len(valid_document_chunks_list),
+        "chunks_upserted_count": len(qdrant_point_structures_list),
     }
 
-
 if __name__ == "__main__":
-    target = Path(sys.argv[1]) if len(sys.argv) > 1 else None
-    run(target)
+    target_source_path = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+    execute_ingestion_pipeline(target_source_path)
