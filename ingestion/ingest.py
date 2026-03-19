@@ -201,7 +201,7 @@ def execute_ingestion_pipeline(
     text_document_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE_LIMIT,
         chunk_overlap=CHUNK_OVERLAP_SIZE,
-        separators=["\n\n", "\n+ ", "\n- ", "\n* ", "\n", " ", ""],
+        separators=["\n\n", "\n# ", "\n## ", "\n### ", "\n+ ", "\n- ", "\n* ", "\n", " ", ""],
         length_function=len,
     )
     
