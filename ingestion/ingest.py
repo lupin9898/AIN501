@@ -34,13 +34,7 @@ CHUNK_OVERLAP_SIZE = 200
 MINIMUM_CHUNK_LENGTH = 50  
 SUPPORTED_FILE_EXTENSIONS = (".pdf", ".txt", ".md")
 
-# ---------------------------------------------------------------------
-# Backward-compatible aliases (giu cho cac file khac trong project khong bi gay)
-# ---------------------------------------------------------------------
-# UI/README/old code trong repo nay tung dung cac ten sau:
-#   - DATA_DIR, CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_LENGTH, SUPPORTED_EXTENSIONS
-#   - _load_documents, _ensure_collection, run
-# Ban da refactor sang ten moi; alias duoi day giup tuong thich nguoc.
+#  alias duoi day giup tuong thich nguoc.
 DATA_DIR = DATA_DIRECTORY
 CHUNK_SIZE = CHUNK_SIZE_LIMIT
 CHUNK_OVERLAP = CHUNK_OVERLAP_SIZE
