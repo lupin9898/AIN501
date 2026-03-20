@@ -45,7 +45,7 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* Overall background */
+    /* ── Background ───────────────────────── */
     .stApp { background-color: #212121; }
 
     /* Sidebar */
@@ -54,20 +54,14 @@ st.markdown(
         border-right: 1px solid #2f2f2f;
     }
 
-    /* Chat messages — user bubble */
-    [data-testid="stChatMessageContent"] {
-        font-size: 0.97rem;
-        line-height: 1.65;
-    }
-
-    /* Tighten main chat column */
+    /* ── Chat container width ─────────────── */
     .main .block-container {
         max-width: 780px;
         padding-top: 1rem;
         padding-bottom: 5rem;
     }
 
-    /* Chat input bar — sticky bottom feel */
+    /* ── Chat input ───────────────────────── */
     [data-testid="stChatInput"] textarea {
         background: #2f2f2f !important;
         border: 1px solid #3f3f3f !important;
@@ -75,12 +69,27 @@ st.markdown(
         color: #ececec !important;
         font-size: 0.97rem;
     }
-    [data-testid="stChatInput"] textarea:focus {
-        border-color: #555 !important;
-        box-shadow: none !important;
+
+    /* ── ONLY chatbot text (FIX CHÍNH) ───── */
+    [data-testid="stChatMessageContent"] p,
+    [data-testid="stChatMessageContent"] div,
+    [data-testid="stChatMessageContent"] span {
+        color: #ffffff !important;
     }
 
-    /* Source card */
+    /* ── User message bubble ─────────────── */
+    [data-testid="stChatMessage"][data-testid*="user"] {
+        background-color: #2a2a2a !important;
+        border-radius: 12px;
+        padding: 10px;
+    }
+
+    /* ── Assistant message ───────────────── */
+    [data-testid="stChatMessage"][data-testid*="assistant"] {
+        background-color: transparent !important;
+    }
+
+    /* ── Source card ─────────────────────── */
     .source-card {
         background: #2a2a2a;
         border: 1px solid #3a3a3a;
