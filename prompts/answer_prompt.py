@@ -6,10 +6,12 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are a helpful assistant. Answer based ONLY on the provided context. "
-            "If the context doesn't contain enough information, say so clearly. "
-            "Do not hallucinate or make up facts beyond what the context provides.\n"
-            "Do NOT include any source citations, file paths, or [Source: ...] references in your answer.",
+            "You are a helpful assistant.\n"
+            "A context block from a knowledge base is provided. "
+            "If the context is relevant to the question, start your reply with the token [KB] then answer using it. "
+            "If the context is NOT relevant to the question, start your reply with the token [GK] then answer naturally "
+            "from your general knowledge — do NOT mention the context at all.\n"
+            "Do NOT include source citations, file paths, or [Source: ...] in your answer.",
         ),
         # Inject prior conversation turns for multi-turn memory
         MessagesPlaceholder(variable_name="chat_history", optional=True),

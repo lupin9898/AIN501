@@ -1,12 +1,9 @@
-"""HyDE RAG Chatbot — Streamlit UI with file upload and streaming.
-
-Run:
-    cd hyde_rag
-    streamlit run ui.py
-"""
+"""HyDE RAG Chatbot — Streamlit UI."""
 
 from __future__ import annotations
 
+import html as html_lib
+import re
 import tempfile
 import uuid
 from pathlib import Path
@@ -31,120 +28,223 @@ from ingestion.ingest import run as run_ingestion
 from prompts.answer_prompt import ANSWER_PROMPT
 from retrieval.qdrant_client import QdrantRetriever
 
-# ── Page config ─────────────────────────────────────────────────────────
+# ── Page config ──────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="HyDE RAG Chatbot",
-    page_icon="🔍",
+    page_title="RAG Assistant",
+    page_icon="✦",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ──────────────────────────────────────────────────────────
+# ── CSS ──────────────────────────────────────────────────────────────────
 
 st.markdown(
     """
-    <style>
-    /* ── Background ───────────────────────── */
-    .stApp { background-color: #212121; }
+<style>
+/* ── Base ─────────────────────────────────────────────── */
+.stApp { background-color: #1a1a1a; color: #ececec; }
 
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background-color: #171717;
-        border-right: 1px solid #2f2f2f;
-    }
+/* ── Sidebar ──────────────────────────────────────────── */
+section[data-testid="stSidebar"] {
+    background-color: #171717 !important;
+    border-right: 1px solid #272727 !important;
+}
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] small,
+section[data-testid="stSidebar"] div { color: #c9c9c9 !important; }
 
-    /* ── Chat container width ─────────────── */
-    .main .block-container {
-        max-width: 780px;
-        padding-top: 1rem;
-        padding-bottom: 5rem;
-    }
+/* ── Main content width ───────────────────────────────── */
+.main .block-container {
+    max-width: 700px !important;
+    margin: 0 auto !important;
+    padding: 1.5rem 1.25rem 7rem !important;
+}
 
-    /* ── Chat input ───────────────────────── */
-    [data-testid="stChatInput"] textarea {
-        background: #2f2f2f !important;
-        border: 1px solid #3f3f3f !important;
-        border-radius: 12px !important;
-        color: #ececec !important;
-        font-size: 0.97rem;
-    }
+/* ── User bubble (right-aligned) ──────────────────────── */
+.msg-user {
+    display: flex;
+    justify-content: flex-end;
+    margin: 4px 0 20px;
+}
+.msg-user-bubble {
+    background: #2d2d2d;
+    border-radius: 18px 18px 4px 18px;
+    padding: 10px 18px;
+    max-width: 78%;
+    color: #ececec;
+    font-size: 0.95rem;
+    line-height: 1.65;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
 
-    /* ── ONLY chatbot text (FIX CHÍNH) ───── */
-    [data-testid="stChatMessageContent"] p,
-    [data-testid="stChatMessageContent"] div,
-    [data-testid="stChatMessageContent"] span {
-        color: #ffffff !important;
-    }
+/* ── Assistant text (left-aligned, no bg) ─────────────── */
+.msg-assistant {
+    margin: 4px 0 6px;
+}
+.msg-assistant p,
+.msg-assistant li,
+.msg-assistant span {
+    color: #ececec !important;
+    font-size: 0.95rem !important;
+    line-height: 1.7 !important;
+}
+.msg-assistant strong { color: #fff !important; }
+.msg-assistant code {
+    background: #2a2a2a !important;
+    color: #e06c75 !important;
+    border-radius: 4px !important;
+    padding: 1px 6px !important;
+    font-size: 0.87rem !important;
+}
+.msg-assistant pre {
+    background: #222 !important;
+    border: 1px solid #333 !important;
+    border-radius: 10px !important;
+    padding: 0.9rem !important;
+}
+.msg-assistant a { color: #7eb8f7 !important; }
 
-    /* ── User message bubble ─────────────── */
-    [data-testid="stChatMessage"][data-testid*="user"] {
-        background-color: #2a2a2a !important;
-        border-radius: 12px;
-        padding: 10px;
-    }
+/* Global text colour for assistant streaming placeholder */
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li,
+[data-testid="stMarkdownContainer"] td {
+    color: #ececec !important;
+    font-size: 0.95rem !important;
+    line-height: 1.7 !important;
+}
 
-    /* ── Assistant message ───────────────── */
-    [data-testid="stChatMessage"][data-testid*="assistant"] {
-        background-color: transparent !important;
-    }
+/* ── Chat input ───────────────────────────────────────── */
+[data-testid="stChatInput"] {
+    background: #252525 !important;
+    border: 1.5px solid #363636 !important;
+    border-radius: 14px !important;
+}
+[data-testid="stChatInput"]:focus-within { border-color: #505050 !important; }
+[data-testid="stChatInput"] textarea {
+    background: transparent !important;
+    color: #ececec !important;
+    font-size: 0.95rem !important;
+}
+[data-testid="stChatInput"] textarea::placeholder { color: #555 !important; }
 
-    /* ── Source card ─────────────────────── */
-    .source-card {
-        background: #2a2a2a;
-        border: 1px solid #3a3a3a;
-        border-radius: 8px;
-        padding: 0.6rem 0.9rem;
-        margin-bottom: 0.4rem;
-        font-size: 0.83rem;
-    }
+/* ── Expander (sources) ───────────────────────────────── */
+[data-testid="stExpander"] {
+    background: #202020 !important;
+    border: 1px solid #2d2d2d !important;
+    border-radius: 10px !important;
+    margin-top: 8px !important;
+}
+[data-testid="stExpander"] summary {
+    color: #777 !important;
+    font-size: 0.81rem !important;
+    padding: 7px 12px !important;
+}
+[data-testid="stExpander"] summary:hover { color: #aaa !important; }
 
-    /* Hide Streamlit branding */
-    #MainMenu { visibility: hidden; }
-    footer { visibility: hidden; }
-    header { visibility: hidden; }
-    </style>
-    """,
+/* ── Buttons ──────────────────────────────────────────── */
+[data-testid="stBaseButton-primary"] {
+    background: #3a3a3a !important;
+    color: #ececec !important;
+    border: none !important;
+    border-radius: 8px !important;
+}
+[data-testid="stBaseButton-primary"]:hover { background: #484848 !important; }
+[data-testid="stBaseButton-secondary"] {
+    background: transparent !important;
+    border: 1px solid #333 !important;
+    border-radius: 8px !important;
+    color: #bbb !important;
+}
+
+/* ── File uploader ────────────────────────────────────── */
+[data-testid="stFileUploader"] section {
+    background: #1e1e1e !important;
+    border: 1.5px dashed #303030 !important;
+    border-radius: 10px !important;
+}
+
+/* ── Metrics ──────────────────────────────────────────── */
+[data-testid="stMetricValue"] { color: #ececec !important; font-weight: 600 !important; }
+[data-testid="stMetricLabel"] { color: #666 !important; font-size: 0.78rem !important; }
+
+/* ── Caption ──────────────────────────────────────────── */
+.stCaption, [data-testid="stCaptionContainer"] { color: #555 !important; font-size: 0.79rem !important; }
+
+/* ── Alert ────────────────────────────────────────────── */
+[data-testid="stAlert"] {
+    background: #1a221a !important;
+    border: 1px solid #2a3d2a !important;
+    color: #8fc98f !important;
+    border-radius: 8px !important;
+    font-size: 0.82rem !important;
+}
+
+/* ── Hide Streamlit chrome ────────────────────────────── */
+#MainMenu, footer, header { visibility: hidden !important; }
+[data-testid="stDecoration"] { display: none !important; }
+
+hr { border-color: #272727 !important; margin: 0.5rem 0 !important; }
+
+/* GK badge */
+.gk-badge {
+    display: inline-block;
+    background: #1e1e1e;
+    border: 1px solid #2d2d2d;
+    border-radius: 20px;
+    padding: 2px 10px;
+    font-size: 0.74rem;
+    color: #555;
+    margin-top: 6px;
+}
+</style>
+""",
     unsafe_allow_html=True,
 )
 
-# ── Session state init ──────────────────────────────────────────────────
+# ── Session state ────────────────────────────────────────────────────────
 
 
-def _init_session():
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "conversation_history" not in st.session_state:
-        st.session_state.conversation_history = []
-    if "thread_id" not in st.session_state:
-        st.session_state.thread_id = str(uuid.uuid4())
-    if "last_sources" not in st.session_state:
-        st.session_state.last_sources = []
-    if "last_hyde_doc" not in st.session_state:
-        st.session_state.last_hyde_doc = ""
+def _init_session() -> None:
+    defaults: dict = {
+        "messages": [],
+        "conversation_history": [],
+        "thread_id": str(uuid.uuid4()),
+        "last_sources": [],
+        "last_hyde_doc": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
 _init_session()
 
-
-# ── Helper: get Qdrant collection stats ─────────────────────────────────
+# ── Utilities ────────────────────────────────────────────────────────────
 
 
 def _get_collection_stats() -> dict | None:
-    """Return collection point count, or None if Qdrant is unreachable."""
     try:
-        retriever = QdrantRetriever()
-        info = retriever.client.get_collection(settings.COLLECTION_NAME)
+        r = QdrantRetriever()
+        info = r.client.get_collection(settings.COLLECTION_NAME)
         return {"points": info.points_count, "status": info.status.value}
     except Exception:
         return None
 
 
-# ── Helper: stream direct chat (no RAG) ─────────────────────────────────
+def _build_history_messages(history: list[dict]) -> list:
+    recent = history[-20:] if len(history) > 20 else history
+    return [
+        (HumanMessage if t["role"] == "user" else AIMessage)(content=t["content"])
+        for t in recent
+    ]
 
 
 def _stream_direct(query: str, history: list[dict]):
-    """Stream a plain Gemini response when no knowledge base exists yet."""
+    """Stream plain LLM response (no KB context)."""
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
     llm = ChatGoogleGenerativeAI(
@@ -160,28 +260,17 @@ def _stream_direct(query: str, history: list[dict]):
             ("human", "{query}"),
         ]
     )
-    chat_history_messages = []
-    recent = history[-20:] if len(history) > 20 else history
-    for turn in recent:
-        if turn["role"] == "user":
-            chat_history_messages.append(HumanMessage(content=turn["content"]))
-        else:
-            chat_history_messages.append(AIMessage(content=turn["content"]))
-
     for chunk in (prompt | llm).stream(
-        {"query": query, "chat_history": chat_history_messages}
+        {"query": query, "chat_history": _build_history_messages(history)}
     ):
         yield chunk.content
 
 
-# ── Helper: stream the final answer ─────────────────────────────────────
-
-
 def _stream_answer(query: str, context: str, history: list[dict]):
-    """Stream tokens from the LLM for the final answer generation.
+    """Stream RAG answer. Yields (token, used_kb | None).
 
-    Uses the REAL retrieved context (not the hypothetical doc) to ground
-    the response in actual knowledge-base data.
+    LLM prefixes its response with [KB] or [GK] to signal whether it used
+    the knowledge-base context or fell back to general knowledge.
     """
     llm = ChatGoogleGenerativeAI(
         model=settings.LLM_MODEL,
@@ -189,234 +278,311 @@ def _stream_answer(query: str, context: str, history: list[dict]):
         google_api_key=settings.GEMINI_API_KEY,
         streaming=True,
     )
+    buf = ""
+    routing_done = False
+    used_kb: bool | None = None
 
-    # Build chat history messages (last 10 turns)
-    chat_history_messages = []
-    recent = history[-20:] if len(history) > 20 else history
-    for turn in recent:
-        if turn["role"] == "user":
-            chat_history_messages.append(HumanMessage(content=turn["content"]))
-        else:
-            chat_history_messages.append(AIMessage(content=turn["content"]))
-
-    chain = ANSWER_PROMPT | llm
-    for chunk in chain.stream(
-        {"context": context, "query": query, "chat_history": chat_history_messages}
+    for chunk in (ANSWER_PROMPT | llm).stream(
+        {"context": context, "query": query, "chat_history": _build_history_messages(history)}
     ):
-        yield chunk.content
+        token = chunk.content
+        if not routing_done:
+            buf += token
+            if len(buf) >= 4:
+                routing_done = True
+                if buf.startswith("[KB]"):
+                    used_kb = True
+                    buf = buf[4:].lstrip()
+                elif buf.startswith("[GK]"):
+                    used_kb = False
+                    buf = buf[4:].lstrip()
+                else:
+                    used_kb = True
+                yield buf, used_kb
+                buf = ""
+        else:
+            yield token, used_kb
 
 
-# ── Helper: run HyDE pipeline steps 1-5 (silent) ────────────────────────
-
-
-def _run_hyde_pipeline(query: str):
-    """Run the HyDE retrieval pipeline silently and return the assembled state."""
-    state = {
+def _run_hyde_pipeline(query: str) -> dict:
+    state: dict = {
         "query": query,
         "hypothetical_doc": "",
         "hypothetical_vector": [],
+        "sparse_vector": None,
         "retrieved_docs": [],
         "context": "",
         "answer": "",
         "conversation_history": [],
         "error": None,
     }
-
-    for node_fn in [
+    for fn in [
         validate_query_node,
         generate_hypothetical_doc_node,
         embed_hypothetical_node,
         retrieve_documents_node,
         assemble_context_node,
     ]:
-        state.update(node_fn(state))
+        state.update(fn(state))
         if state.get("error"):
             return state
-
     return state
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ── Intent classifier (zero-latency heuristic) ───────────────────────────
+
+# Patterns that are almost certainly NOT KB-related queries
+_CONVERSATIONAL_RE = re.compile(
+    r"""^(
+        # greetings
+        hello|hi+|hey|howdy|hola|sup|yo|
+        chào|xin\s+chào|alo|
+        good\s+(morning|afternoon|evening|night)|
+        # small talk
+        how\s+are\s+you|bạn\s+(có\s+)?khỏe|
+        bạn\s+là\s+ai|you\s+are\s+who|
+        what\s+(is|are)\s+you[r]?|
+        # thanks / ack
+        thanks?|thank\s+you|cảm\s+ơn|
+        ok(ay)?|sure|got\s+it|understood|
+        no\s+problem|you['\u2019]?re\s+welcome|
+        # farewells
+        bye+|goodbye|tạm\s+biệt|see\s+you|
+        # affirmations
+        yes|no|yep|nope|correct|wrong|
+        # emoji-only / single char
+        [\U00010000-\U0010ffff\u2600-\u26FF\u2700-\u27BF]+|
+        [!?.]+
+    )\b""",
+    re.VERBOSE | re.IGNORECASE,
+)
+
+
+def _skip_rag(query: str) -> bool:
+    """Return True when the query is clearly conversational/off-topic.
+
+    Uses zero-latency regex heuristics so the HyDE pipeline is bypassed
+    entirely — no LLM call, no embedding, no Qdrant round-trip.
+
+    Falls back to False (run full pipeline) for ambiguous queries.
+    """
+    q = query.strip()
+    # Very short: 1-3 words — likely chitchat
+    if len(q.split()) <= 3 and not q.endswith("?"):
+        return True
+    # Matches known conversational patterns
+    if _CONVERSATIONAL_RE.match(q):
+        return True
+    return False
+
+
+def _source_label(src: dict) -> str:
+    path = src.get("source", "unknown")
+    name = Path(path).name if path != "unknown" else "unknown"
+    page = f"  tr.{src['page']}" if src.get("page") else ""
+    score = f"  {src['score'] * 100:.0f}%" if src.get("score") else ""
+    return f"📄  {name}{page}{score}"
+
+
+# ── Message render helpers ────────────────────────────────────────────────
+
+
+def _render_user(text: str) -> None:
+    """Right-aligned dark bubble."""
+    safe = html_lib.escape(text)
+    st.markdown(
+        f'<div class="msg-user"><div class="msg-user-bubble">{safe}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_assistant(content: str, sources: list | None = None, from_kb: bool = True) -> None:
+    """Plain left-aligned text + optional sources expander."""
+    st.markdown(content)
+    if sources:
+        with st.expander(f"📄 {len(sources)} nguồn tham khảo", expanded=False):
+            for s in sources:
+                st.caption(_source_label(s))
+    elif not from_kb:
+        st.markdown(
+            "<span class='gk-badge'>💬 general knowledge</span>",
+            unsafe_allow_html=True,
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════
 #  SIDEBAR
-# ═══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown("## 🔍 HyDE RAG Chatbot")
-    st.caption("Hypothetical Document Embedding")
+    st.markdown(
+        "<p style='font-size:1.05rem;font-weight:600;margin-bottom:0'>✦ RAG Assistant</p>"
+        "<p style='font-size:0.74rem;color:#444;margin-top:2px'>HyDE · Hybrid BM25 · Gemini</p>",
+        unsafe_allow_html=True,
+    )
     st.divider()
 
-    # ── New conversation ────────────────────────────────────────────
-    if st.button("🗨️  New Conversation", use_container_width=True):
+    if st.button("＋  New chat", use_container_width=True):
         st.session_state.messages = []
         st.session_state.conversation_history = []
-        st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.last_sources = []
         st.session_state.last_hyde_doc = ""
+        st.session_state.thread_id = str(uuid.uuid4())
         st.rerun()
 
     st.divider()
-
-    # ── File upload & ingestion ─────────────────────────────────────
-    st.markdown("### 📁 Knowledge Base")
-
-    uploaded_files = st.file_uploader(
-        "Upload documents to index",
-        type=["pdf", "txt", "md"],
-        accept_multiple_files=True,
-        help="Supported: PDF, TXT, Markdown",
+    st.markdown(
+        "<p style='font-size:0.83rem;font-weight:600;margin-bottom:4px'>Knowledge Base</p>",
+        unsafe_allow_html=True,
     )
 
-    if uploaded_files:
-        st.caption(f"{len(uploaded_files)} file(s) selected")
+    uploaded = st.file_uploader(
+        "docs",
+        type=["pdf", "txt", "md"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+    )
 
-        if st.button("⬆️  Ingest into RAG", use_container_width=True, type="primary"):
-            progress_area = st.empty()
-            status_msgs: list[str] = []
+    if uploaded:
+        st.caption(f"{len(uploaded)} file(s) chờ index")
+        if st.button("⬆  Ingest", use_container_width=True, type="primary"):
+            log_area = st.empty()
+            log_lines: list[str] = []
 
-            def _ui_progress(msg: str):
-                status_msgs.append(msg)
-                progress_area.info("\n".join(status_msgs))
+            def _prog(msg: str) -> None:
+                log_lines.append(msg)
+                log_area.info("\n".join(log_lines[-5:]))
 
-            total_stats = {"docs_loaded": 0, "chunks_created": 0, "chunks_upserted": 0}
-
-            for uf in uploaded_files:
-                # Save uploaded file to a temp path
+            totals = {"docs_loaded": 0, "chunks_created": 0, "chunks_upserted": 0}
+            for uf in uploaded:
                 suffix = Path(uf.name).suffix
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                     tmp.write(uf.getbuffer())
                     tmp_path = Path(tmp.name)
-
-                _ui_progress(f"--- Processing: {uf.name} ---")
+                _prog(f"→ {uf.name}")
                 try:
-                    stats = run_ingestion(source=tmp_path, on_progress=_ui_progress)
-                    for k in total_stats:
-                        total_stats[k] += stats.get(k, 0)
+                    s = run_ingestion(source=tmp_path, on_progress=_prog)
+                    for k in totals:
+                        totals[k] += s.get(k, 0)
                 except Exception as e:
-                    _ui_progress(f"Error: {e}")
-
-            progress_area.empty()
-            st.success(
-                f"Ingested {total_stats['docs_loaded']} doc(s) → "
-                f"{total_stats['chunks_upserted']} chunks indexed"
-            )
+                    _prog(f"⚠ {e}")
+            log_area.empty()
+            st.success(f"✓  {totals['chunks_upserted']} chunks đã được index")
 
     st.divider()
 
-    # ── Collection stats ────────────────────────────────────────────
-    st.markdown("### 📊 Collection Info")
-    stats = _get_collection_stats()
-    if stats:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Vectors", f"{stats['points']:,}")
-        with col2:
-            st.metric("Status", stats["status"].upper())
-        st.caption(f"Collection: `{settings.COLLECTION_NAME}`")
+    col_stats = _get_collection_stats()
+    if col_stats:
+        c1, c2 = st.columns(2)
+        c1.metric("Chunks", f"{col_stats['points']:,}")
+        c2.metric("DB", col_stats["status"].upper()[:2])
+        st.caption(f"`{settings.COLLECTION_NAME}`")
     else:
-        st.warning("Qdrant not reachable")
-        st.caption(f"URL: `{settings.QDRANT_URL}`")
+        st.caption("⚠  Qdrant offline")
 
     st.divider()
 
-    # ── Last query details ──────────────────────────────────────────
     if st.session_state.last_hyde_doc:
-        with st.expander("🧠 Last HyDE Document", expanded=False):
+        with st.expander("🧠 HyDE document", expanded=False):
             st.markdown(
-                f"<div style='font-size:0.82rem; color:#c9d1d9;'>"
-                f"{st.session_state.last_hyde_doc}</div>",
+                f"<div style='font-size:0.78rem;color:#777;white-space:pre-wrap'>"
+                f"{html_lib.escape(st.session_state.last_hyde_doc[:600])}…</div>",
                 unsafe_allow_html=True,
             )
 
     if st.session_state.last_sources:
-        with st.expander("📚 Last Retrieved Sources", expanded=False):
-            for src in st.session_state.last_sources:
-                score_pct = src["score"] * 100
-                st.markdown(
-                    f"<div class='source-card'>"
-                    f"📄 {src['source']}"
-                    f"{'  (p.' + str(src['page']) + ')' if src.get('page') else ''}"
-                    f" — <span class='score'>{score_pct:.1f}%</span>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
+        with st.expander(f"📄 {len(st.session_state.last_sources)} sources", expanded=False):
+            for s in st.session_state.last_sources:
+                st.caption(_source_label(s))
 
     st.divider()
-    st.caption(f"Model: `{settings.LLM_MODEL}`")
-    st.caption(f"Embeddings: `{settings.EMBEDDING_MODEL}`")
+    st.caption(f"Model  `{settings.LLM_MODEL}`")
+    st.caption(f"Embed  `{settings.EMBEDDING_MODEL.split('/')[-1]}`")
 
-
-# ═══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  MAIN CHAT AREA
-# ═══════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
-# Empty welcome state
 if not st.session_state.messages:
     st.markdown(
         """
-        <div style="text-align:center; padding: 6rem 1rem 2rem;">
-            <p style="font-size:2rem; margin-bottom:0.5rem;">🔍</p>
-            <h2 style="font-weight:600; margin-bottom:0.4rem;">HyDE RAG Chatbot</h2>
-            <p style="color:#8b949e; font-size:0.95rem;">
-                Hỏi đáp từ knowledge base của bạn.<br/>
-                Upload tài liệu ở sidebar để bắt đầu.
+        <div style="text-align:center;padding:5rem 0 2rem;">
+            <div style="font-size:2.6rem;margin-bottom:0.6rem;opacity:.8">✦</div>
+            <h2 style="font-weight:600;font-size:1.5rem;color:#ececec;margin:0 0 0.5rem">
+                RAG Assistant
+            </h2>
+            <p style="color:#4a4a4a;font-size:0.92rem;line-height:1.7;max-width:360px;margin:0 auto">
+                Hỏi đáp từ tài liệu của bạn.<br>
+                Tự động fallback sang general AI khi không có context.
             </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-# Render existing messages
+# Render chat history (no st.chat_message — no action buttons)
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    if msg["role"] == "user":
+        _render_user(msg["content"])
+    else:
+        _render_assistant(
+            msg["content"],
+            sources=msg.get("sources"),
+            from_kb=msg.get("from_kb", True),
+        )
 
-        # Show sources inline for assistant messages
-        if msg["role"] == "assistant" and msg.get("sources"):
-            with st.expander(f"📚 {len(msg['sources'])} source(s) used", expanded=False):
-                for src in msg["sources"]:
-                    score_pct = src["score"] * 100
-                    label = src["source"]
-                    if src.get("page"):
-                        label += f" (p.{src['page']})"
-                    st.caption(f"📄 {label} — **{score_pct:.1f}%** relevance")
+# ── Chat input ───────────────────────────────────────────────────────────
 
-# ── Chat input ──────────────────────────────────────────────────────────
-
-if prompt := st.chat_input("Nhập câu hỏi ..."):
+if prompt := st.chat_input("Nhập câu hỏi …"):
+    # Render user bubble immediately
+    _render_user(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        # Check KB before running the full pipeline
-        kb_stats = _get_collection_stats()
-        has_kb = kb_stats and kb_stats.get("points", 0) > 0
+    # ── Assistant response ────────────────────────────────────────────
+    kb_stats = _get_collection_stats()
+    has_kb = bool(kb_stats and kb_stats.get("points", 0) > 0)
 
-        if not has_kb:
-            # Stream directly without running HyDE pipeline
-            full_answer = st.write_stream(
-                _stream_direct(prompt, st.session_state.conversation_history)
-            )
-            sources = []
+    sources: list[dict] = []
+    from_kb = False
+
+    # Fast path: skip HyDE pipeline for obvious conversational queries
+    if has_kb and _skip_rag(prompt):
+        has_kb = False  # treat as no-KB so we stream direct immediately
+
+    if not has_kb:
+        # No KB → direct LLM
+        answer_placeholder = st.empty()
+        parts: list[str] = []
+        for token in _stream_direct(prompt, st.session_state.conversation_history):
+            parts.append(token)
+            answer_placeholder.markdown("".join(parts))
+        full_answer = "".join(parts)
+        st.markdown(
+            "<span class='gk-badge'>💬 general knowledge</span>",
+            unsafe_allow_html=True,
+        )
+
+    else:
+        with st.spinner(""):
+            state = _run_hyde_pipeline(prompt)
+
+        error = state.get("error")
+        is_missing = error and (
+            "chưa có dữ liệu" in error or "doesn't exist" in error
+        )
+
+        if error and not is_missing:
+            full_answer = f"⚠  {error}"
+            st.markdown(full_answer)
+
         else:
-            # Run HyDE pipeline silently, then stream
-            with st.spinner(""):
-                state = _run_hyde_pipeline(prompt)
+            st.session_state.last_hyde_doc = state.get("hypothetical_doc", "")
+            context = state.get("context", "")
+            docs = state.get("retrieved_docs", [])
 
-            error_msg = state.get("error")
-            no_kb = error_msg and (
-                "chưa có dữ liệu" in error_msg or "doesn't exist" in error_msg
-            )
-
-            if error_msg and not no_kb:
-                full_answer = error_msg
-                st.markdown(full_answer)
-                sources = []
-            else:
-                st.session_state.last_hyde_doc = state.get("hypothetical_doc", "")
-
-                docs = state.get("retrieved_docs", [])
-                sources = [
+            if context:
+                # RAG path — LLM decides [KB] or [GK]
+                candidate_sources = [
                     {
                         "source": d.metadata.get("source", "unknown"),
                         "page": d.metadata.get("page", ""),
@@ -424,31 +590,58 @@ if prompt := st.chat_input("Nhập câu hỏi ..."):
                     }
                     for d in docs
                 ]
-                st.session_state.last_sources = sources
+                answer_parts: list[str] = []
+                used_kb: bool | None = None
+                answer_placeholder = st.empty()
 
-                context = state.get("context", "")
-                if not context:
-                    full_answer = st.write_stream(
-                        _stream_direct(prompt, st.session_state.conversation_history)
-                    )
-                else:
-                    full_answer = st.write_stream(
-                        _stream_answer(
-                            query=prompt,
-                            context=context,
-                            history=st.session_state.conversation_history,
-                        )
-                    )
+                for token, routing in _stream_answer(
+                    prompt, context, st.session_state.conversation_history
+                ):
+                    answer_parts.append(token)
+                    used_kb = routing
+                    answer_placeholder.markdown("".join(answer_parts))
+
+                full_answer = "".join(answer_parts)
+
+                if used_kb:
+                    from_kb = True
+                    sources = candidate_sources
+                    st.session_state.last_sources = sources
                     if sources:
-                        with st.expander(f"📚 {len(sources)} nguồn", expanded=False):
-                            for src in sources:
-                                label = src["source"]
-                                if src.get("page"):
-                                    label += f" (tr.{src['page']})"
-                                st.caption(f"📄 {label} — **{src['score']*100:.1f}%**")
+                        with st.expander(
+                            f"📄 {len(sources)} nguồn tham khảo", expanded=False
+                        ):
+                            for s in sources:
+                                st.caption(_source_label(s))
+                else:
+                    st.markdown(
+                        "<span class='gk-badge'>💬 general knowledge</span>",
+                        unsafe_allow_html=True,
+                    )
 
-        st.session_state.messages.append(
-            {"role": "assistant", "content": full_answer, "sources": sources}
-        )
-        st.session_state.conversation_history.append({"role": "user", "content": prompt})
-        st.session_state.conversation_history.append({"role": "assistant", "content": full_answer})
+            else:
+                # No relevant context → direct LLM
+                answer_placeholder = st.empty()
+                parts = []
+                for token in _stream_direct(prompt, st.session_state.conversation_history):
+                    parts.append(token)
+                    answer_placeholder.markdown("".join(parts))
+                full_answer = "".join(parts)
+                st.markdown(
+                    "<span class='gk-badge'>💬 general knowledge</span>",
+                    unsafe_allow_html=True,
+                )
+
+    # Persist
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": full_answer,
+            "sources": sources,
+            "from_kb": from_kb,
+        }
+    )
+    st.session_state.conversation_history.append({"role": "user", "content": prompt})
+    st.session_state.conversation_history.append(
+        {"role": "assistant", "content": full_answer}
+    )

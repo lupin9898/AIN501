@@ -72,6 +72,12 @@ class QdrantRetriever:
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 if use_hybrid:
+                    # Relevance gate: run dense-only first to check if any doc
+                    # passes the cosine threshold.  If none does, the query is
+                    # off-topic — return empty so the UI falls back to direct LLM.
+                    gate = self._dense_search(vector, top_k=1, score_threshold=score_threshold)
+                    if not gate:
+                        return []
                     points = self._hybrid_search(vector, sparse_vector, top_k)  # type: ignore[arg-type]
                 else:
                     points = self._dense_search(vector, top_k, score_threshold)
