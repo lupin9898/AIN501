@@ -19,7 +19,8 @@ class GraphState(TypedDict):
 
     query: str  # Original user question
     hypothetical_doc: str  # LLM-generated ideal answer document
-    hypothetical_vector: list[float]  # Embedding of hypothetical_doc
+    hypothetical_vector: list[float]  # Dense embedding of hypothetical_doc
+    sparse_vector: Optional[dict]  # BM25 sparse vector {"indices", "values"} or None
     retrieved_docs: list[Document]  # Documents retrieved from Qdrant
     context: str  # Assembled context string for final generation
     answer: str  # Final answer returned to the user

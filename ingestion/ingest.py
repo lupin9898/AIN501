@@ -26,6 +26,7 @@ from qdrant_client import models
 
 from config import settings
 from retrieval.embedder import HyDEEmbedder
+from retrieval.sparse_embedder import BM25Embedder
 
 DATA_DIRECTORY = Path(__file__).resolve().parent.parent / "data"
 
@@ -140,11 +141,71 @@ def load_documents_from_source(source_path: Path):
 
 
 def ensure_qdrant_collection_exists(qdrant_client, target_collection_name: str, embedding_vector_size: int, logger_function=None):
-    """Create the Qdrant collection if it doesn't exist; else check vector size matches."""
+    """Create (or recreate) the Qdrant collection with named dense + sparse vectors.
+
+    When HYBRID_SEARCH is enabled the collection uses:
+      • named vector  "dense"  — cosine similarity, size = embedding_vector_size
+      • sparse vector "sparse" — BM25 via fastembed
+
+    If an existing collection was created with the old flat-vector format it
+    is automatically recreated so that hybrid upsert/search works correctly.
+    All existing data will be lost and must be re-ingested.
+    """
     logger_function = logger_function or (lambda message: print(message))
-    existing_collections_list = [collection.name for collection in qdrant_client.get_collections().collections]
-    
-    if target_collection_name not in existing_collections_list:
+    existing_names = [c.name for c in qdrant_client.get_collections().collections]
+
+    if target_collection_name in existing_names:
+        info = qdrant_client.get_collection(target_collection_name)
+        vectors_cfg = info.config.params.vectors
+
+        # Detect old flat-vector format (VectorParams, not a dict of named vectors)
+        is_flat = not isinstance(vectors_cfg, dict)
+        if settings.HYBRID_SEARCH and is_flat:
+            logger_function(
+                f"[Ingest] Collection '{target_collection_name}' dùng định dạng vector cũ. "
+                "Đang xóa và tạo lại với named vectors để hỗ trợ hybrid search …"
+            )
+            qdrant_client.delete_collection(target_collection_name)
+        elif not settings.HYBRID_SEARCH and is_flat:
+            # Old flat format is fine for dense-only
+            existing_size = vectors_cfg.size  # type: ignore[union-attr]
+            if existing_size != embedding_vector_size:
+                raise ValueError(
+                    f"Kích thước vector không khớp: collection '{target_collection_name}' "
+                    f"có kích thước {existing_size}, model trả về {embedding_vector_size}."
+                )
+            logger_function(f"[Ingest] Collection '{target_collection_name}' đã tồn tại và hợp lệ")
+            return
+        elif isinstance(vectors_cfg, dict):
+            dense_params = vectors_cfg.get(settings.DENSE_VECTOR_NAME)
+            if dense_params and dense_params.size != embedding_vector_size:
+                raise ValueError(
+                    f"Kích thước vector dense không khớp: collection có {dense_params.size}, "
+                    f"model trả về {embedding_vector_size}."
+                )
+            logger_function(f"[Ingest] Collection '{target_collection_name}' đã tồn tại và hợp lệ")
+            return
+
+    if settings.HYBRID_SEARCH:
+        qdrant_client.create_collection(
+            collection_name=target_collection_name,
+            vectors_config={
+                settings.DENSE_VECTOR_NAME: models.VectorParams(
+                    size=embedding_vector_size,
+                    distance=models.Distance.COSINE,
+                )
+            },
+            sparse_vectors_config={
+                settings.SPARSE_VECTOR_NAME: models.SparseVectorParams(
+                    index=models.SparseIndexParams(on_disk=False)
+                )
+            },
+        )
+        logger_function(
+            f"[Ingest] Đã tạo collection hybrid '{target_collection_name}' "
+            f"(dense={settings.DENSE_VECTOR_NAME}, sparse={settings.SPARSE_VECTOR_NAME})"
+        )
+    else:
         qdrant_client.create_collection(
             collection_name=target_collection_name,
             vectors_config=models.VectorParams(
@@ -153,15 +214,6 @@ def ensure_qdrant_collection_exists(qdrant_client, target_collection_name: str, 
             ),
         )
         logger_function(f"[Ingest] Đã tạo collection mới: '{target_collection_name}'")
-    else:
-        collection_information = qdrant_client.get_collection(target_collection_name)
-        existing_vector_size = collection_information.config.params.vectors.size
-        if existing_vector_size != embedding_vector_size:
-            raise ValueError(
-                f"Kích thước vector không khớp: collection '{target_collection_name}' có kích thước {existing_vector_size}, "
-                f"trong khi model embedding trả về {embedding_vector_size}. Hãy tạo collection mới hoặc sử dụng model embedding tương ứng."
-            )
-        logger_function(f"[Ingest] Collection '{target_collection_name}' đã tồn tại và hợp lệ")
 
 
 def execute_ingestion_pipeline(
@@ -222,8 +274,8 @@ def execute_ingestion_pipeline(
 
     hyde_embedding_model = HyDEEmbedder()
     chunk_text_strings_list = [document_chunk.page_content for document_chunk in valid_document_chunks_list]
-    logger_function("Đang tiến hành tạo vector embedding cho các đoạn chunk ...")
-    
+    logger_function("Đang tiến hành tạo vector embedding (dense) cho các đoạn chunk ...")
+
     try:
         embedding_vectors_list = hyde_embedding_model.embed_documents(chunk_text_strings_list)
     except Exception as embedding_generation_error:
@@ -233,12 +285,22 @@ def execute_ingestion_pipeline(
             "chunks_created_count": len(valid_document_chunks_list),
             "chunks_upserted_count": 0,
         }
-        
+
     if not embedding_vectors_list or len(embedding_vectors_list) != len(valid_document_chunks_list):
         logger_function("Hệ thống khởi tạo vector thất bại hoặc số lượng vector không khớp với chunk. Đã dừng tiến trình an toàn.")
         return {"documents_loaded_count": len(loaded_documents_list), "chunks_created_count": len(valid_document_chunks_list), "chunks_upserted_count": 0}
-        
+
     embedding_vector_dimensions_size = len(embedding_vectors_list[0])
+
+    sparse_vectors_list: list[dict | None] = [None] * len(valid_document_chunks_list)
+    if settings.HYBRID_SEARCH:
+        logger_function("Đang tiến hành tạo BM25 sparse vector cho các đoạn chunk ...")
+        try:
+            bm25_embedder = BM25Embedder()
+            sparse_vectors_list = bm25_embedder.embed(chunk_text_strings_list)
+            logger_function(f"Đã tạo {len(sparse_vectors_list)} BM25 sparse vector.")
+        except Exception as sparse_error:
+            logger_function(f"Cảnh báo: BM25 sparse embedding thất bại ({sparse_error}). Tiếp tục với dense-only.")
 
     from retrieval.qdrant_client import QdrantRetriever
 
@@ -255,11 +317,28 @@ def execute_ingestion_pipeline(
         return {"documents_loaded_count": len(loaded_documents_list), "chunks_created_count": len(valid_document_chunks_list), "chunks_upserted_count": 0}
 
     qdrant_point_structures_list = []
-    for document_chunk, embedding_vector in zip(valid_document_chunks_list, embedding_vectors_list):
+    for document_chunk, dense_vec, sparse_vec in zip(
+        valid_document_chunks_list, embedding_vectors_list, sparse_vectors_list
+    ):
+        if settings.HYBRID_SEARCH and sparse_vec is not None:
+            vector_payload: dict | list = {
+                settings.DENSE_VECTOR_NAME: dense_vec,
+                settings.SPARSE_VECTOR_NAME: models.SparseVector(
+                    indices=sparse_vec["indices"],
+                    values=sparse_vec["values"],
+                ),
+            }
+        elif settings.HYBRID_SEARCH:
+            # sparse generation failed for this chunk — store dense only in named slot
+            vector_payload = {settings.DENSE_VECTOR_NAME: dense_vec}
+        else:
+            # Dense-only mode: use flat (unnamed) vector for backward compat
+            vector_payload = dense_vec  # type: ignore[assignment]
+
         qdrant_point_structures_list.append(
             models.PointStruct(
                 id=str(uuid.uuid4()),
-                vector=embedding_vector,
+                vector=vector_payload,
                 payload={
                     "page_content": document_chunk.page_content,
                     "metadata": document_chunk.metadata,

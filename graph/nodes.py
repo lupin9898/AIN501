@@ -20,12 +20,14 @@ from graph.state import GraphState
 from prompts.answer_prompt import ANSWER_PROMPT
 from prompts.hyde_prompt import HYDE_PROMPT
 from retrieval.embedder import HyDEEmbedder
+from retrieval.sparse_embedder import BM25Embedder
 from retrieval.qdrant_client import CollectionNotFoundError, QdrantRetriever
 
 # ── Lazy singletons (deferred until first use so dotenv is loaded) ─────
 _llm_creative = None
 _llm_factual = None
 _embedder = None
+_sparse_embedder = None
 _retriever = None
 
 
@@ -56,6 +58,13 @@ def _get_embedder():
     if _embedder is None:
         _embedder = HyDEEmbedder()
     return _embedder
+
+
+def _get_sparse_embedder():
+    global _sparse_embedder
+    if _sparse_embedder is None:
+        _sparse_embedder = BM25Embedder()
+    return _sparse_embedder
 
 
 def _get_retriever():
@@ -116,10 +125,21 @@ def embed_hypothetical_node(state: GraphState) -> dict:
     also answer-style text.  Embedding both in the same "style space"
     produces far better cosine-similarity scores than embedding a short
     question against long answer passages.
+
+    When HYBRID_SEARCH is enabled, also computes a BM25 sparse vector from
+    the same hypothetical document for use in RRF fusion retrieval.
     """
     hypothetical_doc = state["hypothetical_doc"]
-    vector = _get_embedder().embed_query(hypothetical_doc)
-    return {"hypothetical_vector": vector}
+    dense_vector = _get_embedder().embed_query(hypothetical_doc)
+
+    sparse_vector = None
+    if settings.HYBRID_SEARCH:
+        try:
+            sparse_vector = _get_sparse_embedder().embed_query(hypothetical_doc)
+        except Exception as exc:
+            print(f"\n[Hybrid] BM25 sparse embedding failed ({exc}), falling back to dense-only")
+
+    return {"hypothetical_vector": dense_vector, "sparse_vector": sparse_vector}
 
 
 # ── 4. Retrieve Documents from Qdrant ─────────────────────────────────
@@ -129,11 +149,15 @@ def retrieve_documents_node(state: GraphState) -> dict:
 
     The search vector comes from the HyDE embedding (step 3), NOT from
     embedding the user's raw query.  This is the core of the HyDE pattern.
+
+    When HYBRID_SEARCH is enabled and a sparse_vector is present, performs
+    RRF-fused hybrid retrieval (dense + BM25).
     """
     vector = state["hypothetical_vector"]
+    sparse_vector = state.get("sparse_vector")
 
     try:
-        docs = _get_retriever().search(vector=vector)
+        docs = _get_retriever().search(vector=vector, sparse_vector=sparse_vector)
     except CollectionNotFoundError as exc:
         return {"retrieved_docs": [], "error": str(exc)}
     except ConnectionError as exc:

@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     SCORE_THRESHOLD: float = 0.6
     MAX_CONTEXT_TOKENS: int = 3000
 
+    # Hybrid search (dense + BM25 sparse via RRF fusion)
+    HYBRID_SEARCH: bool = True
+    DENSE_VECTOR_NAME: str = "dense"
+    SPARSE_VECTOR_NAME: str = "sparse"
+
     model_config = {"env_file": str(_ENV_FILE), "env_file_encoding": "utf-8"}
 
 
