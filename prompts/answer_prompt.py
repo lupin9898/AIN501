@@ -9,7 +9,7 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
             "You are a helpful assistant. Answer based ONLY on the provided context. "
             "If the context doesn't contain enough information, say so clearly. "
             "Do not hallucinate or make up facts beyond what the context provides.\n"
-            "Always cite the source when possible using [Source: ...] notation.",
+            "Do NOT include any source citations, file paths, or [Source: ...] references in your answer.",
         ),
         # Inject prior conversation turns for multi-turn memory
         MessagesPlaceholder(variable_name="chat_history", optional=True),
